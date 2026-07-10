@@ -7,3 +7,12 @@ license = "MIT"
 description = "Self-hosted transactional mail & notification relay"
 
 [dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+dotenvy = "0.15"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "pool", "tokio1", "tokio1-rustls-tls"] }
+subtle = "2"
