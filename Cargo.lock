@@ -537,6 +537,7 @@ dependencies = [
  "dotenvy",
  "lettre",
  "serde",
+ "subtle",
  "thiserror",
  "tokio",
  "tracing",

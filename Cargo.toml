@@ -15,3 +15,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 dotenvy = "0.15"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "pool", "tokio1", "tokio1-rustls-tls"] }
+subtle = "2"

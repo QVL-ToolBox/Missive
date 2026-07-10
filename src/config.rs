@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 pub const DEFAULT_PORT: u16 = 8184;
 pub const MIN_INTERNAL_API_SECRET_BYTES: usize = 32;
+pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
 
 const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -22,12 +23,27 @@ pub enum ConfigError {
     ExternalBindRefused(IpAddr),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: IpAddr,
     pub port: u16,
     pub smtp: SmtpConfig,
     pub mail_from: Mailbox,
+    pub internal_api_secret: String,
+    pub rate_limit_per_minute: u32,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("port", &self.port)
+            .field("smtp", &self.smtp)
+            .field("mail_from", &self.mail_from)
+            .field("internal_api_secret", &"***")
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,22 +69,34 @@ impl std::fmt::Debug for SmtpCredentials {
 }
 
 pub fn load() -> Result<Config, ConfigError> {
-    validate_internal_api_secret()?;
     Ok(Config {
+        internal_api_secret: load_internal_api_secret()?,
         bind_addr: load_bind_addr()?,
         port: load_port()?,
         smtp: load_smtp()?,
         mail_from: load_mail_from()?,
+        rate_limit_per_minute: load_rate_limit_per_minute()?,
     })
 }
 
-fn validate_internal_api_secret() -> Result<(), ConfigError> {
+fn load_internal_api_secret() -> Result<String, ConfigError> {
     let secret = require("INTERNAL_API_SECRET")?;
     let len = secret.len();
     if len < MIN_INTERNAL_API_SECRET_BYTES {
         return Err(ConfigError::WeakInternalApiSecret(len));
     }
-    Ok(())
+    Ok(secret)
+}
+
+fn load_rate_limit_per_minute() -> Result<u32, ConfigError> {
+    match optional("RATE_LIMIT_PER_MINUTE") {
+        None => Ok(DEFAULT_RATE_LIMIT_PER_MINUTE),
+        Some(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(ConfigError::InvalidValue("RATE_LIMIT_PER_MINUTE", raw)),
+    }
 }
 
 fn load_bind_addr() -> Result<IpAddr, ConfigError> {
