@@ -1,0 +1,9 @@
+[package]
+name = "missive"
+version = "0.1.0"
+edition = "2021"
+authors = ["Martin QUEVAL"]
+license = "MIT"
+description = "Self-hosted transactional mail & notification relay"
+
+[dependencies]
