@@ -193,7 +193,103 @@ INTERNAL_API_SECRET=changez-ce-secret-de-32-octets-minimum
 
 Lancer Missive, envoyer un message via l'exemple `POST /v1/send` ci-dessus, puis ouvrir l'interface Mailpit sur [http://127.0.0.1:8025](http://127.0.0.1:8025) pour voir le mail reçu.
 
+Si `MAIL_FROM` contient un nom d'affichage avec chevrons, il doit être quoté dans le `.env` (`MAIL_FROM="Missive <no-reply@example.test>"`) : des chevrons non quotés rendent le fichier entier illisible par dotenvy et produisent une erreur trompeuse « INTERNAL_API_SECRET manquant ».
+
+## Déploiement serveur (systemd)
+
+Déploiement manuel (Phase 0, sans CI). Cible : Linux avec systemd, Missive en loopback derrière l'appelant local. Adapter les chemins `/opt/custhome` à votre installation.
+
+### 1. Unité systemd
+
+`/etc/systemd/system/missive.service` :
+
+```ini
+[Unit]
+Description=Missive transactional mailer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=missive
+ExecStart=/opt/custhome/missive
+EnvironmentFile=/opt/custhome/missive.env
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Le secret est chargé via `EnvironmentFile`, jamais via `Environment=` inline (que `systemctl show` exposerait). `User=missive` est un compte de service dédié non privilégié, à créer au préalable (`sudo useradd --system --no-create-home --shell /usr/sbin/nologin missive`).
+
+### 2. Fichier d'environnement
+
+`/opt/custhome/missive.env` — variables minimales, bind loopback laissé par défaut (ne pas poser `ALLOW_EXTERNAL_BIND`) :
+
+```
+SMTP_HOST=smtp.interne.example
+MAIL_FROM="Missive <no-reply@example.com>"
+INTERNAL_API_SECRET=le-meme-secret-32-octets-que-l-appelant
+```
+
+`INTERNAL_API_SECRET` doit être identique à la valeur `MISSIVE_API_SECRET` configurée côté appelant. Verrouiller les accès :
+
+```
+sudo chown missive:missive /opt/custhome/missive.env
+sudo chmod 600 /opt/custhome/missive.env
+sudo chmod 750 /opt/custhome
+```
+
+### 3. Déploiement du binaire
+
+Compiler :
+
+```
+cargo build --release
+```
+
+Écosystème QVL (le nom d'unité doit correspondre au nom passé) :
+
+```
+sudo /usr/local/bin/ch-deploy-bin missive target/release/missive
+```
+
+Self-hébergement générique — copier le binaire puis (re)charger l'unité :
+
+```
+sudo cp target/release/missive /opt/custhome/missive
+sudo systemctl daemon-reload
+sudo systemctl enable --now missive
+```
+
+Vérifier : `systemctl status missive` puis `curl http://127.0.0.1:8184/health`.
+
+### 4. Pare-feu et exposition
+
+Le port `8184` reste fermé sur toute interface externe : Missive n'est joignable que par l'appelant local. S'il devait un jour devenir distant, TLS obligatoire via reverse-proxy et réouverture du point d'audit MISS-01 (authentification avant lecture du corps de requête).
+
+### 5. Rotation du secret en production
+
+Séquence deux-services pour minimiser la fenêtre de mismatch :
+
+1. Mettre à jour `INTERNAL_API_SECRET` dans les DEUX fichiers d'environnement (Missive et appelant).
+2. Redémarrer Missive : `sudo systemctl restart missive`.
+3. Redémarrer l'appelant.
+
+Pendant un mismatch, Missive renvoie `401` et les mails ne partent pas — panne silencieuse côté appelant.
+
+### 6. Supervision
+
+Sonder `GET /health`. Alerter sur les logs d'échec de l'appelant (ex. « Appel Missive en échec » côté Authenticator) : c'est le seul signal exploitable, l'API appelante masquant les pannes d'envoi par design.
+
 ## Décisions
 
 - 2026-07-10 (SCRUM-323) : contrat d'API versionné sous `/v1/send`.
 - 2026-07-10 (SCRUM-324) : mailer « bête » sans templating (sujet et corps fournis par l'appelant) ; canal `push` réservé et renvoyant `501`.
+- 2026-07-13 (SCRUM-321/441) : déploiement Phase 0 manuel documenté (systemd), pas de CI tant que la cadence ne le justifie pas.
