@@ -1,18 +1,22 @@
 [package]
 name = "missive"
-version = "0.1.0"
+version = "2.0.2"
 edition = "2021"
 authors = ["Martin QUEVAL"]
 license = "MIT"
-description = "Self-hosted transactional mail & notification relay"
+description = "Transactional SMTP mail library with TLS enforcement and global rate limit"
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
-axum = "0.8"
-tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
-dotenvy = "0.15"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "pool", "tokio1", "tokio1-rustls-tls"] }
-subtle = "2"
+tokio = { version = "1", features = ["time"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing-subscriber = { version = "0.3", features = ["json"] }
+serde_json = "1"

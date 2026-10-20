@@ -1,295 +1,170 @@
 # Missive
 
-Mailer transactionnel générique, auto-hébergeable. Missive expose une petite API HTTP et achemine un message vers un serveur SMTP, sans logique métier. Le service est volontairement « bête » : l'appelant fournit un sujet et un corps déjà rendus, Missive ne fait aucun templating ni personnalisation. Seul le canal `email` est opérationnel ; le canal `push` est réservé et répond `501 Not Implemented`.
+Librairie Rust d'envoi de mails transactionnels par SMTP. L'appelant fournit un sujet et un corps déjà rendus ; Missive ne fait ni templating ni personnalisation. Elle impose un mode TLS explicite, plafonne le nombre d'envois par minute et ne journalise aucun contenu.
 
-Stack : Rust (stable) + Axum + lettre.
+Stack : Rust (stable) + lettre (rustls), runtime Tokio fourni par l'appelant.
 
-> Intégration dans l'écosystème QVL : voir `Tools/ENVCONFIG.md`. Ce README couvre uniquement l'auto-hébergement autonome via un fichier `.env`.
+Miroir public à chaque release : [GitHub `QVL-ToolBox/Missive`](https://github.com/QVL-ToolBox/Missive) (un commit par version, tag `vX.Y.Z`).
 
-## Démarrage rapide
+Depuis la v2.0.0, Missive n'expose plus de serveur HTTP : elle s'embarque directement dans le service qui envoie des mails.
 
-Prérequis : Rust stable (`rustc` / `cargo`, via [rustup](https://rustup.rs)).
+## Installation
 
+```toml
+[dependencies]
+missive = { git = "https://github.com/QVL-ToolBox/Missive", tag = "v2.0.2" }
 ```
-git clone <url-du-repo> missive
-cd missive
-```
-
-Créer le fichier de configuration à partir du modèle, puis l'éditer :
-
-Linux / macOS :
-
-```
-cp .env.example .env
-```
-
-Windows (PowerShell) :
-
-```
-Copy-Item .env.example .env
-```
-
-Éditer `.env` et renseigner au minimum `SMTP_HOST`, `MAIL_FROM` et `INTERNAL_API_SECRET` (voir [Configuration](#configuration)). Compiler puis lancer le binaire :
-
-```
-cargo build --release
-```
-
-Linux / macOS :
-
-```
-./target/release/missive
-```
-
-Windows (PowerShell) :
-
-```
-.\target\release\missive.exe
-```
-
-Missive lit automatiquement le fichier `.env` du répertoire courant au démarrage. Vérifier que le service répond :
-
-```
-curl http://127.0.0.1:8184/health
-```
-
-Réponse attendue : `{"status":"ok"}`.
-
-## Configuration
-
-Toute la configuration passe par des variables d'environnement (ou le fichier `.env`). Une valeur vide ou composée uniquement d'espaces est traitée comme absente. Toute variable requise manquante, ou toute valeur invalide, provoque un refus de démarrage immédiat (fail-fast) avec un log d'erreur.
-
-| Variable | Rôle | Requis | Défaut |
-|---|---|---|---|
-| `PORT` | Port d'écoute HTTP. Doit être > 0. | Optionnel | `8184` |
-| `BIND_ADDR` | Adresse d'écoute HTTP. Une adresse non-loopback exige `ALLOW_EXTERNAL_BIND=true`. | Optionnel | `127.0.0.1` |
-| `ALLOW_EXTERNAL_BIND` | Autorise explicitement un bind non-loopback. Toute valeur autre que `true` (insensible à la casse) refuse le bind externe. | Optionnel | `false` |
-| `SMTP_HOST` | Hôte du serveur SMTP relais. | **Requis** | — |
-| `SMTP_PORT` | Port du serveur SMTP. | Optionnel | Défaut du transport : `587` (avec credentials, STARTTLS) ou `25` (sans credentials) |
-| `SMTP_USER` | Identifiant SMTP. Actif uniquement si `SMTP_PASSWORD` est également renseigné. | Optionnel | — |
-| `SMTP_PASSWORD` | Mot de passe SMTP. Actif uniquement si `SMTP_USER` est également renseigné. | Optionnel | — |
-| `MAIL_FROM` | Expéditeur appliqué à tous les envois. Format Mailbox : `Nom <adresse@domaine>` ou `adresse@domaine`. | **Requis** | — |
-| `INTERNAL_API_SECRET` | Secret d'authentification inter-services (header `x-internal-secret`). Minimum 32 octets UTF-8. Refus de démarrer si absent ou trop court. Sensible : ne jamais committer. | **Requis** | — |
-| `RATE_LIMIT_PER_MINUTE` | Nombre maximal d'envois acceptés par minute (fenêtre fixe, global au service). Doit être un entier > 0 ; valeur invalide ou `0` = refus de démarrer. | Optionnel | `60` |
-
-Mode SMTP selon les credentials :
-
-- `SMTP_USER` **et** `SMTP_PASSWORD` renseignés : authentification SMTP avec chiffrement STARTTLS.
-- L'un des deux manquant (ou les deux) : connexion en clair, sans TLS ni authentification. Ce mode convient à un serveur SMTP local de développement (type Mailpit) et ne doit pas être utilisé vers un relais distant.
-
-Verbosité des logs : contrôlée par `RUST_LOG` (format `EnvFilter`, ex. `RUST_LOG=info`). Défaut : `info`. Les logs sont émis au format JSON.
-
-## Sécurité
-
-Bind loopback par défaut. `BIND_ADDR` vaut `127.0.0.1` : le service n'est joignable que localement. Pour l'exposer sur une interface externe (ex. `0.0.0.0`), il faut à la fois définir `BIND_ADDR` et positionner `ALLOW_EXTERNAL_BIND=true`. Sans cet opt-in explicite, un bind non-loopback fait échouer le démarrage : il n'y a pas de repli silencieux. En exposition externe, placer Missive derrière un reverse-proxy terminant TLS ; Missive ne sert pas de TLS lui-même.
-
-Authentification. Chaque `POST /v1/send` doit porter le header `x-internal-secret` égal à `INTERNAL_API_SECRET`. La comparaison est faite en temps constant. Un secret absent, vide ou incorrect renvoie `401`.
-
-Expéditeur. L'adresse d'expédition est toujours `MAIL_FROM`, définie côté serveur. Elle n'est jamais dérivée du payload de la requête.
-
-Confidentialité des logs. Missive ne journalise ni le corps, ni le sujet, ni l'adresse complète du destinataire, ni le secret, ni les credentials SMTP. Seuls le domaine du destinataire, le code de réponse SMTP et la latence sont tracés.
-
-### Rotation du secret
-
-1. Générer une nouvelle valeur d'au moins 32 octets.
-
-   Linux / macOS :
-
-   ```
-   openssl rand -base64 48
-   ```
-
-   Windows (PowerShell) :
-
-   ```
-   $b = New-Object byte[] 48; [System.Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($b); [Convert]::ToBase64String($b)
-   ```
-
-2. Mettre à jour `INTERNAL_API_SECRET` dans le `.env` de Missive.
-3. Redémarrer Missive pour charger le nouveau secret.
-4. Mettre à jour la valeur `x-internal-secret` chez tous les clients appelants.
 
 ## API
 
-### `GET /health`
+```rust
+#[non_exhaustive]
+pub struct MailConfig {
+    pub host: String,
+    pub port: Option<NonZeroU16>,
+    pub tls: TlsMode,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub max_per_minute: u32,
+    pub timeout_secs: Option<NonZeroU64>,
+}
 
-Sonde de disponibilité. Aucune authentification. Répond toujours `200` avec `{"status":"ok"}`.
+impl MailConfig {
+    pub fn new(host: impl Into<String>, tls: TlsMode, from: impl Into<String>) -> Self;
+    pub fn with_port(self, port: NonZeroU16) -> Self;
+    pub fn with_credentials(self, user: impl Into<String>, password: impl Into<String>) -> Self;
+    pub fn with_max_per_minute(self, max_per_minute: u32) -> Self;
+    pub fn with_timeout(self, timeout_secs: NonZeroU64) -> Self;
+}
 
-### `POST /v1/send`
+#[non_exhaustive] pub enum TlsMode { Tls, StartTls, Plaintext }
+#[non_exhaustive] pub enum Environment { Dev, Prod }
 
-Header requis : `x-internal-secret`. Corps JSON :
+pub enum Body<'a> { Text(&'a str), Html(&'a str), Both { text: &'a str, html: &'a str } }
 
-```json
-{
-  "channel": "email",
-  "to": "destinataire@example.com",
-  "subject": "Sujet du message",
-  "html": "<p>Corps HTML</p>",
-  "text": "Corps texte"
+impl Mailer {
+    pub fn new(config: &MailConfig, environment: Environment) -> Result<Mailer, MailError>;
+    pub async fn send(&self, to: &str, subject: &str, body: Body<'_>) -> Result<(), MailError>;
 }
 ```
 
-Contraintes du payload :
+`MailConfig` est `#[non_exhaustive]` : hors de la crate, on la construit par désérialisation ou par `MailConfig::new` suivi des `with_*` ; ses champs restent lisibles et modifiables.
 
-- `channel` : `email` (opérationnel) ou `push` (réservé, renvoie `501`).
-- `to` : un seul destinataire, adresse valide (une virgule est refusée).
-- `subject` : requis, sans retour à la ligne (`\r` ou `\n` refusés).
-- `html` et `text` : optionnels, mais au moins un des deux doit être non vide. Fournir les deux produit un message multipart (alternative texte/HTML).
-- Taille du corps de requête : ≤ 512 Ko.
+`Mailer::new` valide toute la configuration et construit le transport SMTP sans ouvrir de connexion : une configuration invalide échoue au démarrage du service appelant, jamais au premier envoi. `new` ne requiert pas de runtime ; `send` s'exécute sous Tokio, avec le driver de temps activé (`enable_all()` ou `#[tokio::main]`), car l'envoi entier est borné par `timeout_secs` ; une connexion SMTP par envoi. Un `Mailer` est `Send + Sync` et se partage derrière un `Arc` : le plafond d'envois est global à l'instance.
 
-En cas de succès : `200` avec `{"status":"sent"}` (le message a été accepté par le serveur SMTP). Les erreurs applicatives (`400` de validation, `401`, `429`, `501`, `502`, `500`) ont un corps vide. Les rejets faits par le framework avant d'atteindre la logique applicative (`400` JSON malformé, `413`, `415`, `422`) renvoient un corps `text/plain` décrivant le rejet.
+`send` vérifie, dans cet ordre, le destinataire, le sujet et le corps, puis le plafond, et seulement ensuite contacte le serveur SMTP. Un envoi refusé ne consomme pas de quota, sauf s'il est refusé par le serveur SMTP.
 
-| Code | Cause |
+| Contrainte d'envoi | Erreur |
 |---|---|
-| `200` | Message accepté et transmis au serveur SMTP. |
-| `400` | Payload invalide, deux origines : validation applicative (canal inconnu, destinataire absent/invalide, plusieurs destinataires, sujet contenant un retour à la ligne, ou ni `html` ni `text` non vide) ou JSON syntaxiquement invalide. |
-| `401` | Header `x-internal-secret` absent, vide ou incorrect. |
-| `413` | Corps de requête au-delà de 512 Ko. |
-| `415` | En-tête `content-type` absent ou différent de `application/json`. |
-| `422` | JSON syntaxiquement valide mais champ requis manquant ou de type incorrect (ex. `subject` absent). |
-| `429` | Limite d'envois par minute atteinte. |
-| `501` | Canal `push` : réservé, non implémenté. |
-| `502` | Échec de transmission au serveur SMTP (aucun détail exposé). |
-| `500` | Erreur interne (message non constructible). |
+| `to` : une seule adresse valide (une virgule est refusée) | `InvalidRecipient` |
+| `subject` : sans `\r` ni `\n` | `InvalidSubject` |
+| `body` : aucune partie vide ; `Body::Both` produit un multipart texte/HTML | `EmptyBody` |
+| Plafond `max_per_minute` atteint (fenêtre fixe d'une minute) | `RateLimited` |
+| Échec de transmission SMTP | `Send { permanent, code }` (code SMTP s'il y en a un, jamais le texte du serveur) |
 
-## Exemples
+L'expéditeur est toujours `from`, jamais un paramètre d'envoi.
 
-Vérifier la disponibilité :
+## Configuration
 
-```
-curl http://127.0.0.1:8184/health
-```
+`MailConfig` se désérialise (serde) depuis la configuration de l'appelant ; Missive ne lit aucune variable d'environnement.
 
-Envoyer un email (corps HTML + texte) :
+| Champ | Rôle | Requis | Défaut |
+|---|---|---|---|
+| `host` | Hôte du serveur SMTP. | Oui | — |
+| `port` | Port SMTP, non nul (`0` est refusé à la désérialisation). | Non | Celui du mode TLS : `465` (`tls`), `587` (`starttls`), `25` (`none`) |
+| `tls` | `tls`, `starttls` ou `none`. | Oui | — |
+| `user` / `password` | Authentification SMTP. Les deux ou aucun. | Non | — |
+| `from` | Expéditeur : `Nom <adresse@domaine>` ou `adresse@domaine`. | Oui | — |
+| `max_per_minute` | Plafond global d'envois par minute, > 0. | Non | `60` |
+| `timeout_secs` | Délai maximal, en secondes, de toute l'opération d'envoi (connexion, bannière, TLS, commandes SMTP), quel que soit le mode TLS ; au-delà, `send` renvoie `Send { permanent: false, code: None }`. L'expiration ne garantit pas que le mail n'a pas été transmis : survenue après `DATA`, une nouvelle tentative peut créer un doublon. Non nul (`0` est refusé à la désérialisation). | Non | `15` |
 
-```
-curl -X POST http://127.0.0.1:8184/v1/send -H "content-type: application/json" -H "x-internal-secret: REMPLACER_PAR_VOTRE_SECRET" -d '{"channel":"email","to":"destinataire@example.com","subject":"Bonjour","html":"<p>Ceci est un test</p>","text":"Ceci est un test"}'
-```
+`Debug` de `MailConfig` masque `user` et `password`.
 
-Sous PowerShell, utiliser `curl.exe` (le `curl` de PowerShell est un alias d'`Invoke-WebRequest` à la syntaxe différente).
+Erreurs de validation renvoyées par `Mailer::new` :
 
-## Tester en local avec Mailpit
+| Cas | Erreur |
+|---|---|
+| `host` vide | `MissingHost` |
+| `tls = "none"` avec `Environment::Prod` | `PlaintextInProduction` |
+| `tls = "none"` vers un hôte autre que `localhost`, `127.0.0.0/8` ou `::1` | `PlaintextToRemoteHost` |
+| `user` sans `password` ou l'inverse (une valeur blanche compte comme absente) | `PartialCredentials` |
+| `from` illisible | `InvalidSender` |
+| `max_per_minute = 0` | `ZeroRateLimit` |
+| Paramètres TLS inconstructibles pour l'hôte | `Transport` |
 
-Mailpit fournit un serveur SMTP jetable et une interface web pour inspecter les mails capturés (rien n'est réellement envoyé).
+## Modes TLS
 
-Avec Docker :
+- `tls` : TLS implicite dès la connexion (SMTPS). Mode recommandé vers un relais distant.
+- `starttls` : connexion en clair puis passage obligatoire en TLS via `STARTTLS` ; l'envoi échoue si le serveur ne le propose pas.
+- `none` : aucun chiffrement. Réservé au développement contre un SMTP local jetable (Mailpit) : accepté uniquement en `Environment::Dev` et vers un hôte loopback.
 
-```
-docker run -p 1025:1025 -p 8025:8025 axllent/mailpit
-```
+Aucun mode ne retombe silencieusement sur une connexion en clair.
 
-Sans Docker : télécharger le binaire standalone depuis [github.com/axllent/mailpit/releases](https://github.com/axllent/mailpit/releases) et le lancer (il écoute par défaut sur `1025` pour le SMTP et `8025` pour l'interface web).
+## Confidentialité des logs
 
-Configurer `.env` pour pointer sur Mailpit (SMTP en clair, sans credentials) :
+Missive émet un log `info` par envoi réussi et `warn` par échec SMTP, avec uniquement le domaine du destinataire (`recipient_domain`), le code SMTP (`smtp_code`), le caractère permanent de l'échec et son expiration (`permanent`, `timed_out`, en `warn`) et la latence (`latency_ms`). Ni le sujet, ni le corps, ni l'adresse complète, ni les identifiants, ni le texte de réponse du serveur SMTP n'apparaissent dans les logs. L'appelant installe son propre subscriber `tracing`.
 
-```
-SMTP_HOST=127.0.0.1
-SMTP_PORT=1025
-SMTP_USER=
-SMTP_PASSWORD=
-MAIL_FROM=missive@example.test
-INTERNAL_API_SECRET=changez-ce-secret-de-32-octets-minimum
-```
+Côté appelant, seul le `Display` de `MailError` est à journaliser : c'est la forme garantie sans contenu. `MailError` n'embarque aucune erreur source.
 
-Lancer Missive, envoyer un message via l'exemple `POST /v1/send` ci-dessus, puis ouvrir l'interface Mailpit sur [http://127.0.0.1:8025](http://127.0.0.1:8025) pour voir le mail reçu.
+## Exemple d'intégration
 
-Si `MAIL_FROM` contient un nom d'affichage avec chevrons, il doit être quoté dans le `.env` (`MAIL_FROM="Missive <no-reply@example.test>"`) : des chevrons non quotés rendent le fichier entier illisible par dotenvy et produisent une erreur trompeuse « INTERNAL_API_SECRET manquant ».
+Configuration TOML de l'appelant :
 
-## Déploiement serveur (systemd)
-
-Déploiement manuel (Phase 0, sans CI). Cible : Linux avec systemd, Missive en loopback derrière l'appelant local. Adapter les chemins `/opt/custhome` à votre installation.
-
-### 1. Unité systemd
-
-`/etc/systemd/system/missive.service` :
-
-```ini
-[Unit]
-Description=Missive transactional mailer
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=missive
-ExecStart=/opt/custhome/missive
-EnvironmentFile=/opt/custhome/missive.env
-Restart=on-failure
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ProtectKernelTunables=true
-RestrictAddressFamilies=AF_INET AF_INET6
-MemoryDenyWriteExecute=true
-
-[Install]
-WantedBy=multi-user.target
+```toml
+[mail]
+host = "smtp.example.com"
+port = 587
+tls = "starttls"
+user = "no-reply@example.com"
+password = "secret-hors-depot"
+from = "Acme <no-reply@example.com>"
+max_per_minute = 60
 ```
 
-Le secret est chargé via `EnvironmentFile`, jamais via `Environment=` inline (que `systemctl show` exposerait). `User=missive` est un compte de service dédié non privilégié, à créer au préalable (`sudo useradd --system --no-create-home --shell /usr/sbin/nologin missive`).
+Démarrage et envoi :
 
-### 2. Fichier d'environnement
+```rust
+use missive::{Body, Environment, MailConfig, MailError, Mailer};
+use std::sync::Arc;
 
-`/opt/custhome/missive.env` — variables minimales, bind loopback laissé par défaut (ne pas poser `ALLOW_EXTERNAL_BIND`) :
+fn build_mailer(config: &MailConfig, environment: Environment) -> Result<Arc<Mailer>, MailError> {
+    Mailer::new(config, environment).map(Arc::new)
+}
 
-```
-SMTP_HOST=smtp.interne.example
-MAIL_FROM="Missive <no-reply@example.com>"
-INTERNAL_API_SECRET=le-meme-secret-32-octets-que-l-appelant
-```
-
-`INTERNAL_API_SECRET` doit être identique à la valeur `MISSIVE_API_SECRET` configurée côté appelant. Verrouiller les accès :
-
-```
-sudo chown missive:missive /opt/custhome/missive.env
-sudo chmod 600 /opt/custhome/missive.env
-sudo chmod 750 /opt/custhome
+async fn send_reset_link(mailer: &Mailer, to: &str, link: &str) -> Result<(), MailError> {
+    let text = format!("Réinitialisez votre mot de passe : {link}");
+    mailer.send(to, "Réinitialisation du mot de passe", Body::Text(&text)).await
+}
 ```
 
-### 3. Déploiement du binaire
+Sans fichier de configuration :
 
-Compiler :
-
-```
-cargo build --release
-```
-
-Écosystème QVL (le nom d'unité doit correspondre au nom passé) :
-
-```
-sudo /usr/local/bin/ch-deploy-bin missive target/release/missive
+```rust
+let config = MailConfig::new("smtp.example.com", TlsMode::Tls, "Acme <no-reply@example.com>")
+    .with_credentials(user, password)
+    .with_max_per_minute(30);
 ```
 
-Self-hébergement générique — copier le binaire puis (re)charger l'unité :
+En développement, contre Mailpit (`docker run -p 1025:1025 -p 8025:8025 axllent/mailpit`) :
 
+```toml
+[mail]
+host = "127.0.0.1"
+port = 1025
+tls = "none"
+from = "missive@example.test"
 ```
-sudo cp target/release/missive /opt/custhome/missive
-sudo systemctl daemon-reload
-sudo systemctl enable --now missive
-```
 
-Vérifier : `systemctl status missive` puis `curl http://127.0.0.1:8184/health`.
+Les mails capturés sont visibles sur http://127.0.0.1:8025.
 
-### 4. Pare-feu et exposition
+## CI
 
-Le port `8184` reste fermé sur toute interface externe : Missive n'est joignable que par l'appelant local. S'il devait un jour devenir distant, TLS obligatoire via reverse-proxy et réouverture du point d'audit MISS-01 (authentification avant lecture du corps de requête).
-
-### 5. Rotation du secret en production
-
-Séquence deux-services pour minimiser la fenêtre de mismatch :
-
-1. Mettre à jour `INTERNAL_API_SECRET` dans les DEUX fichiers d'environnement (Missive et appelant).
-2. Redémarrer Missive : `sudo systemctl restart missive`.
-3. Redémarrer l'appelant.
-
-Pendant un mismatch, Missive renvoie `401` et les mails ne partent pas — panne silencieuse côté appelant.
-
-### 6. Supervision
-
-Sonder `GET /health`. Alerter sur les logs d'échec de l'appelant (ex. « Appel Missive en échec » côté Authenticator) : c'est le seul signal exploitable, l'API appelante masquant les pannes d'envoi par design.
+`azure-pipelines.yml` étend `service.yml` de [QVL-ToolBox/Pipelines](https://dev.azure.com/qvl-project/QVL-ToolBox/_git/Pipelines) en `deployMode: none` : Qualite (`cargo fmt --check`, `clippy -D warnings`, `cargo test`) sur toutes les branches, puis tag `vX.Y.Z` sur `main` d'après la version de `Cargo.toml`. Rien n'est déployé. `Cargo.lock` reste committé (scanné par osv-scanner).
 
 ## Décisions
 
-- 2026-07-10 (SCRUM-323) : contrat d'API versionné sous `/v1/send`.
-- 2026-07-10 (SCRUM-324) : mailer « bête » sans templating (sujet et corps fournis par l'appelant) ; canal `push` réservé et renvoyant `501`.
-- 2026-07-13 (SCRUM-321/441) : déploiement Phase 0 manuel documenté (systemd), pas de CI tant que la cadence ne le justifie pas.
+- 2026-07-10 (SCRUM-324) : mailer « bête » sans templating, sujet et corps fournis par l'appelant.
+- 2026-10-06 : CI/CD par le template unique `service.yml` de QVL-ToolBox/Pipelines.
+- 2026-10-13 (#103) : Missive v2.0.0 devient une crate lib (plus de serveur HTTP, plus de `/v1/send`, `/health`, `INTERNAL_API_SECRET` ni canal `push`), pipeline en `deployMode: none`.
+- 2026-10-16 (#122) : le service HTTP v1 (port 8184) est retiré de CustHome ; CH-Api-Authenticator envoie ses mails par la crate, via la lib Auth v0.7.0 (#119). MISS-01 (loopback-only) et l'appel HTTP de SCRUM-325/326 sont sans objet.

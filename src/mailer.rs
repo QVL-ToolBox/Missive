@@ -1,381 +1,190 @@
-use crate::config::{Config, SmtpConfig};
+use crate::config::{Environment, MailConfig, TlsMode, ValidatedMailConfig};
+use crate::error::MailError;
+use crate::rate_limit::RateLimiter;
 use lettre::message::{Mailbox, MessageBuilder, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::Error as SmtpError;
+use lettre::transport::smtp::AsyncSmtpTransportBuilder;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-#[derive(Debug, thiserror::Error)]
-pub enum MailerError {
-    #[error("configuration SMTP invalide")]
-    Transport(#[source] SmtpError),
-    #[error("destinataire invalide")]
-    InvalidRecipient,
-    #[error("corps de message vide")]
-    EmptyBody,
-    #[error("message invalide")]
-    Build(#[source] lettre::error::Error),
-    #[error("envoi SMTP en échec")]
-    Send(#[source] SmtpError),
+type SmtpTransport = AsyncSmtpTransport<Tokio1Executor>;
+
+#[derive(Clone, Copy)]
+pub enum Body<'a> {
+    Text(&'a str),
+    Html(&'a str),
+    Both { text: &'a str, html: &'a str },
+}
+
+impl std::fmt::Debug for Body<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Body::Text(_) => "Text",
+            Body::Html(_) => "Html",
+            Body::Both { .. } => "Both",
+        };
+        f.write_str(kind)
+    }
+}
+
+impl Body<'_> {
+    fn has_empty_part(&self) -> bool {
+        match self {
+            Body::Text(content) | Body::Html(content) => content.is_empty(),
+            Body::Both { text, html } => text.is_empty() || html.is_empty(),
+        }
+    }
 }
 
 pub struct Mailer {
-    transport: AsyncSmtpTransport<Tokio1Executor>,
+    transport: SmtpTransport,
     from: Mailbox,
+    rate_limiter: RateLimiter,
+    timeout: Duration,
 }
 
 impl Mailer {
-    pub fn from_config(config: &Config) -> Result<Self, MailerError> {
+    pub fn new(config: &MailConfig, environment: Environment) -> Result<Self, MailError> {
+        let validated = config.validate(environment)?;
+        let transport = build_transport(&validated)?;
         Ok(Self {
-            transport: build_transport(&config.smtp)?,
-            from: config.mail_from.clone(),
+            transport,
+            from: validated.from,
+            rate_limiter: RateLimiter::per_minute(validated.max_per_minute),
+            timeout: validated.timeout,
         })
     }
 
-    pub async fn send(
+    pub async fn send(&self, to: &str, subject: &str, body: Body<'_>) -> Result<(), MailError> {
+        let recipient = parse_single_recipient(to)?;
+        let recipient_domain = recipient.email.domain().to_owned();
+        let message = self.compose(recipient, subject, body)?;
+        self.acquire_quota()?;
+        self.deliver(message, &recipient_domain).await
+    }
+
+    fn compose(
         &self,
-        to: &str,
+        recipient: Mailbox,
         subject: &str,
-        html: Option<&str>,
-        text: Option<&str>,
-    ) -> Result<(), MailerError> {
-        let recipient: Mailbox = to.parse().map_err(|_| MailerError::InvalidRecipient)?;
+        body: Body<'_>,
+    ) -> Result<Message, MailError> {
+        ensure_single_line(subject)?;
+        if body.has_empty_part() {
+            return Err(MailError::EmptyBody);
+        }
         let builder = Message::builder()
             .from(self.from.clone())
             .to(recipient)
             .subject(subject);
-        let message = build_message(builder, html, text)?;
+        attach_body(builder, body)
+    }
 
+    fn acquire_quota(&self) -> Result<(), MailError> {
+        if self.rate_limiter.try_acquire() {
+            Ok(())
+        } else {
+            Err(MailError::RateLimited)
+        }
+    }
+
+    async fn deliver(&self, message: Message, recipient_domain: &str) -> Result<(), MailError> {
         let started = Instant::now();
-        match self.transport.send(message).await {
-            Ok(response) => {
+        match tokio::time::timeout(self.timeout, self.transport.send(message)).await {
+            Ok(Ok(response)) => {
                 tracing::info!(
-                    recipient_domain = domain_of(to),
-                    smtp_code = ?response.code(),
+                    recipient_domain,
+                    smtp_code = u16::from(response.code()),
                     latency_ms = started.elapsed().as_millis() as u64,
                     "email transmis au serveur SMTP"
                 );
                 Ok(())
             }
-            Err(error) => {
-                tracing::warn!(
-                    recipient_domain = domain_of(to),
-                    latency_ms = started.elapsed().as_millis() as u64,
-                    "echec de transmission au serveur SMTP"
-                );
-                Err(MailerError::Send(error))
-            }
+            Ok(Err(error)) => Err(SmtpFailure::rejected(&error).report(recipient_domain, started)),
+            Err(_) => Err(SmtpFailure::TIMED_OUT.report(recipient_domain, started)),
         }
     }
 }
 
-fn build_message(
-    builder: MessageBuilder,
-    html: Option<&str>,
-    text: Option<&str>,
-) -> Result<Message, MailerError> {
-    let message = match (html, text) {
-        (Some(html), Some(text)) => builder.multipart(MultiPart::alternative_plain_html(
-            text.to_string(),
-            html.to_string(),
-        )),
-        (Some(html), None) => builder.singlepart(SinglePart::html(html.to_string())),
-        (None, Some(text)) => builder.singlepart(SinglePart::plain(text.to_string())),
-        (None, None) => return Err(MailerError::EmptyBody),
-    };
-    message.map_err(MailerError::Build)
+struct SmtpFailure {
+    permanent: bool,
+    code: Option<u16>,
+    timed_out: bool,
 }
 
-fn build_transport(smtp: &SmtpConfig) -> Result<AsyncSmtpTransport<Tokio1Executor>, MailerError> {
-    let mut builder = match &smtp.credentials {
-        Some(credentials) => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp.host)
-            .map_err(MailerError::Transport)?
-            .credentials(Credentials::new(
-                credentials.user.clone(),
-                credentials.password.clone(),
-            )),
-        None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp.host),
+impl SmtpFailure {
+    const TIMED_OUT: Self = Self {
+        permanent: false,
+        code: None,
+        timed_out: true,
     };
-    if let Some(port) = smtp.port {
-        builder = builder.port(port);
+
+    fn rejected(error: &lettre::transport::smtp::Error) -> Self {
+        Self {
+            permanent: error.is_permanent(),
+            code: error.status().map(u16::from),
+            timed_out: false,
+        }
+    }
+
+    fn report(self, recipient_domain: &str, started: Instant) -> MailError {
+        tracing::warn!(
+            recipient_domain,
+            smtp_code = ?self.code,
+            permanent = self.permanent,
+            timed_out = self.timed_out,
+            latency_ms = started.elapsed().as_millis() as u64,
+            "echec de transmission au serveur SMTP"
+        );
+        MailError::Send {
+            permanent: self.permanent,
+            code: self.code,
+        }
+    }
+}
+
+fn parse_single_recipient(to: &str) -> Result<Mailbox, MailError> {
+    if to.contains(',') {
+        return Err(MailError::InvalidRecipient);
+    }
+    to.parse::<Mailbox>()
+        .map_err(|_| MailError::InvalidRecipient)
+}
+
+fn ensure_single_line(subject: &str) -> Result<(), MailError> {
+    if subject.contains(['\r', '\n']) {
+        return Err(MailError::InvalidSubject);
+    }
+    Ok(())
+}
+
+fn attach_body(builder: MessageBuilder, body: Body<'_>) -> Result<Message, MailError> {
+    let message = match body {
+        Body::Text(text) => builder.singlepart(SinglePart::plain(text.to_owned())),
+        Body::Html(html) => builder.singlepart(SinglePart::html(html.to_owned())),
+        Body::Both { text, html } => builder.multipart(MultiPart::alternative_plain_html(
+            text.to_owned(),
+            html.to_owned(),
+        )),
+    };
+    message.map_err(|_| MailError::Build)
+}
+
+fn build_transport(config: &ValidatedMailConfig) -> Result<SmtpTransport, MailError> {
+    let mut builder = transport_builder(config.tls, &config.host)?;
+    if let Some(port) = config.port {
+        builder = builder.port(port.get());
+    }
+    if let Some(credentials) = &config.credentials {
+        builder = builder.credentials(credentials.clone());
     }
     Ok(builder.build())
 }
 
-fn domain_of(address: &str) -> &str {
-    address.rsplit('@').next().unwrap_or(address)
-}
-
-#[cfg(test)]
-mod acceptance_tests {
-    use super::*;
-    use crate::config::SmtpCredentials;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    const MAILPIT_HOST: &str = "127.0.0.1";
-    const MAILPIT_SMTP_PORT: u16 = 1025;
-    const SERVER_FROM: &str = "Missive Test <missive-from@missive.test>";
-    const SECRET_TOKEN: &str = "INTERNALSECRETLEAKMARKER0123456789ABCDEF";
-    const CREDENTIAL_USER_TOKEN: &str = "SMTPUSERLEAKMARKER";
-    const CREDENTIAL_PASSWORD_TOKEN: &str = "SMTPPASSWORDLEAKMARKER";
-
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn as_text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'writer> MakeWriter<'writer> for CapturedLogs {
-        type Writer = CapturedLogs;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn unique_token(prefix: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("{prefix}{nanos}")
-    }
-
-    fn config_without_credentials() -> Config {
-        Config {
-            bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 8184,
-            smtp: SmtpConfig {
-                host: MAILPIT_HOST.to_string(),
-                port: Some(MAILPIT_SMTP_PORT),
-                credentials: None,
-            },
-            mail_from: SERVER_FROM.parse().unwrap(),
-            internal_api_secret: SECRET_TOKEN.to_string(),
-            rate_limit_per_minute: 60,
-        }
-    }
-
-    fn config_with_credentials() -> Config {
-        Config {
-            bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 8184,
-            smtp: SmtpConfig {
-                host: MAILPIT_HOST.to_string(),
-                port: Some(MAILPIT_SMTP_PORT),
-                credentials: Some(SmtpCredentials {
-                    user: CREDENTIAL_USER_TOKEN.to_string(),
-                    password: CREDENTIAL_PASSWORD_TOKEN.to_string(),
-                }),
-            },
-            mail_from: SERVER_FROM.parse().unwrap(),
-            internal_api_secret: SECRET_TOKEN.to_string(),
-            rate_limit_per_minute: 60,
-        }
-    }
-
-    const UNREACHABLE_SMTP_PORT: u16 = 2;
-
-    fn config_with_credentials_unreachable_smtp() -> Config {
-        Config {
-            bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 8184,
-            smtp: SmtpConfig {
-                host: MAILPIT_HOST.to_string(),
-                port: Some(UNREACHABLE_SMTP_PORT),
-                credentials: Some(SmtpCredentials {
-                    user: CREDENTIAL_USER_TOKEN.to_string(),
-                    password: CREDENTIAL_PASSWORD_TOKEN.to_string(),
-                }),
-            },
-            mail_from: SERVER_FROM.parse().unwrap(),
-            internal_api_secret: SECRET_TOKEN.to_string(),
-            rate_limit_per_minute: 60,
-        }
-    }
-
-    fn capture_send(config: Config, to: &str, subject: &str, body: String) -> (bool, String) {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-
-        let succeeded = tracing::subscriber::with_default(subscriber, || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let mailer = Mailer::from_config(&config).unwrap();
-                mailer.send(to, subject, None, Some(&body)).await.is_ok()
-            })
-        });
-
-        (succeeded, logs.as_text())
-    }
-
-    #[test]
-    fn successful_send_log_omits_subject_body_secret_and_credentials() {
-        let subject = unique_token("SUBJECTLEAKMARKER");
-        let body = unique_token("BODYLEAKMARKER");
-        let recipient = format!("{}@recipient.example", unique_token("rcpt"));
-
-        let (succeeded, logs) = capture_send(
-            config_without_credentials(),
-            &recipient,
-            &subject,
-            body.clone(),
-        );
-
-        assert!(succeeded, "l'envoi vers Mailpit doit réussir");
-        assert!(!logs.is_empty(), "un log de succès doit être émis");
-
-        assert!(
-            !logs.contains(&subject),
-            "le subject ne doit jamais apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(&body),
-            "le corps ne doit jamais apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(SECRET_TOKEN),
-            "aucun secret ne doit apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(CREDENTIAL_USER_TOKEN) && !logs.contains(CREDENTIAL_PASSWORD_TOKEN),
-            "aucun credential SMTP ne doit apparaître dans les logs"
-        );
-    }
-
-    #[test]
-    fn successful_send_log_exposes_only_tolerated_fields() {
-        let subject = unique_token("SUBJECTFIELDMARKER");
-        let body = unique_token("BODYFIELDMARKER");
-        let recipient = format!("{}@fields.example", unique_token("rcpt"));
-
-        let (succeeded, logs) =
-            capture_send(config_without_credentials(), &recipient, &subject, body);
-
-        assert!(succeeded, "l'envoi vers Mailpit doit réussir");
-        assert!(
-            logs.contains("recipient_domain"),
-            "recipient_domain est toléré et attendu"
-        );
-        assert!(
-            logs.contains("smtp_code"),
-            "smtp_code est toléré et attendu"
-        );
-        assert!(
-            logs.contains("latency_ms"),
-            "latency_ms est toléré et attendu"
-        );
-        assert!(
-            logs.contains("fields.example"),
-            "le domaine du destinataire est toléré"
-        );
-    }
-
-    #[test]
-    fn failed_send_with_credentials_does_not_leak_credentials() {
-        let subject = unique_token("SUBJECTCREDMARKER");
-        let body = unique_token("BODYCREDMARKER");
-        let recipient = format!("{}@cred.example", unique_token("rcpt"));
-
-        let (_succeeded, logs) = capture_send(
-            config_with_credentials(),
-            &recipient,
-            &subject,
-            body.clone(),
-        );
-
-        assert!(
-            !logs.contains(CREDENTIAL_USER_TOKEN),
-            "le user SMTP ne doit jamais apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(CREDENTIAL_PASSWORD_TOKEN),
-            "le password SMTP ne doit jamais apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(&subject),
-            "le subject ne doit jamais apparaître dans les logs"
-        );
-        assert!(
-            !logs.contains(&body),
-            "le corps ne doit jamais apparaître dans les logs"
-        );
-    }
-
-    #[test]
-    fn smtp_error_path_never_leaks_recipient_subject_body_secret_or_credentials() {
-        let recipient_local = unique_token("RECIPIENTLOCALLEAKMARKER");
-        let recipient = format!("{recipient_local}@error-path.example");
-        let subject = unique_token("SUBJECTERRORLEAKMARKER");
-        let body = unique_token("BODYERRORLEAKMARKER");
-
-        let (succeeded, logs) = capture_send(
-            config_with_credentials_unreachable_smtp(),
-            &recipient,
-            &subject,
-            body.clone(),
-        );
-
-        assert!(
-            !succeeded,
-            "un SMTP injoignable doit faire échouer l'envoi (chemin d'erreur)"
-        );
-        assert!(
-            !logs.is_empty(),
-            "un log d'échec doit être émis sur le chemin d'erreur"
-        );
-        assert!(
-            logs.contains("echec de transmission au serveur SMTP"),
-            "le chemin d'erreur SMTP doit être emprunté"
-        );
-
-        assert!(
-            !logs.contains(&recipient_local),
-            "l'adresse complète du destinataire ne doit jamais apparaître dans les logs d'erreur"
-        );
-        assert!(
-            !logs.contains(&subject),
-            "le subject ne doit jamais apparaître dans les logs d'erreur"
-        );
-        assert!(
-            !logs.contains(&body),
-            "le corps ne doit jamais apparaître dans les logs d'erreur"
-        );
-        assert!(
-            !logs.contains(SECRET_TOKEN),
-            "le secret ne doit jamais apparaître dans les logs d'erreur"
-        );
-        assert!(
-            !logs.contains(CREDENTIAL_USER_TOKEN),
-            "le user SMTP ne doit jamais apparaître dans les logs d'erreur"
-        );
-        assert!(
-            !logs.contains(CREDENTIAL_PASSWORD_TOKEN),
-            "le password SMTP ne doit jamais apparaître dans les logs d'erreur"
-        );
-    }
+fn transport_builder(tls: TlsMode, host: &str) -> Result<AsyncSmtpTransportBuilder, MailError> {
+    let builder = match tls {
+        TlsMode::Tls => SmtpTransport::relay(host),
+        TlsMode::StartTls => SmtpTransport::starttls_relay(host),
+        TlsMode::Plaintext => Ok(SmtpTransport::builder_dangerous(host)),
+    };
+    builder.map_err(|_| MailError::Transport)
 }
